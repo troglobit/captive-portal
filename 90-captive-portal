@@ -1,0 +1,9 @@
+#!/bin/sh
+# SPDX-License-Identifier: ISC
+# NetworkManager dispatcher hook: log in to known captive portals.
+# Installed in dispatcher.d/no-wait.d so NetworkManager does not wait for us.
+
+[ "$2" = "connectivity-change" ] || exit 0
+[ "$CONNECTIVITY_STATE" = "PORTAL" ] || exit 0
+
+exec /usr/local/bin/captive-portal-login --syslog --recheck

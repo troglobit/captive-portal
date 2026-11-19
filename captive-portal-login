@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: ISC
+"""Log in to known Wi-Fi captive portals without a browser.
+
+Run by a NetworkManager dispatcher script when connectivity goes to
+PORTAL, or by hand.  Probes a connectivity-check URL, follows the
+redirect to the portal, picks a handler by the portal's hostname and
+replays the requests the portal's own JavaScript would send.
+
+Handlers:
+  icomera   *.on.icomera.com / ombord.info  (Icomera "CNA" portal)
+  oxyfi     *.internet--access.net          (Oxyfi portal)
+"""
+
+import argparse
+import json
+import random
+import re
+import socket
+import string
+import subprocess
+import sys
+import syslog
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PROBES = [
+    "http://connectivity-check.ubuntu.com/",
+    "http://nmcheck.gnome.org/check-network-status.txt",
+    "http://detectportal.firefox.com/success.txt",
+]
+TIMEOUT = 10
+UA = "Mozilla/5.0 (X11; Linux x86_64) captive-portal-login"
+
+verbose = False
+use_syslog = False
+
+
+def log(msg):
+    if use_syslog:
+        syslog.syslog(syslog.LOG_INFO, msg)
+    if verbose or not use_syslog:
+        print(msg, file=sys.stderr)
+
+
+def debug(msg):
+    if verbose:
+        print("  " + msg, file=sys.stderr)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+opener = urllib.request.build_opener(NoRedirect)
+
+
+def fetch(url, follow=True, data=None):
+    """GET url; return (status, location, body).  Never raises on HTTP errors."""
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": UA,
+                                                          "Cache-Control": "no-cache"})
+    debug("GET " + url)
+    op = urllib.request.build_opener() if follow else opener
+    try:
+        with op.open(req, timeout=TIMEOUT) as r:
+            return r.status, r.headers.get("Location"), r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Location"), e.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, socket.timeout, OSError) as e:
+        debug("error: %s" % e)
+        return None, None, ""
+
+
+def find_portal(probes):
+    """Return the portal URL the network redirects an HTTP probe to, or None."""
+    for url in probes:
+        status, loc, body = fetch(url, follow=False)
+        if status is None:
+            continue
+        if status in (301, 302, 303, 307, 308) and loc:
+            return urllib.parse.urljoin(url, loc)
+        m = re.search(r'(?:url=|href=|location(?:\.href)?\s*=\s*)["\']?(https?://[^"\'\s>]+)',
+                      body, re.I)
+        if status == 200 and m:
+            return m.group(1)
+        if status in (200, 204):
+            return None
+    return None
+
+
+def jsonp(url, params):
+    """GET a JSONP endpoint with a fixed callback name and return the JSON."""
+    q = urllib.parse.urlencode(dict(params, callback="cb"))
+    status, _, body = fetch(url + ("&" if "?" in url else "?") + q)
+    if status != 200:
+        raise RuntimeError("%s -> HTTP %s" % (url, status))
+    m = re.search(r'^[^(]*\((.*)\)\s*;?\s*$', body.strip(), re.S)
+    try:
+        return json.loads(m.group(1) if m else body)
+    except (ValueError, AttributeError):
+        raise RuntimeError("unparsable reply from %s: %r" % (url, body[:200]))
+
+
+# ---------------------------------------------------------------- Icomera
+
+def icomera(portal, base):
+    """Icomera CNA portal: the Connect button is one GET to the hotspot API."""
+    api = base or "https://www.ombord.info"
+    p = urllib.parse.urlsplit(portal)
+    front = "%s://%s/" % (p.scheme, p.netloc)
+    status = jsonp(api + "/api/jsonp/user/", {})
+    if str(status.get("authenticated")) == "1":
+        log("icomera: already authenticated")
+        return True
+    q = urllib.parse.urlencode({"method": "login",
+                                "url": front + "?success=true",
+                                "onerror": front + "?error=true"})
+    st, loc, _ = fetch(api + "/hotspot/hotspot.cgi?" + q, follow=False)
+    debug("login -> %s %s" % (st, loc))
+    if loc and "error=true" in loc:
+        log("icomera: hotspot reported an error: " + loc)
+        return False
+    for _ in range(5):
+        status = jsonp(api + "/api/jsonp/user/", {})
+        if str(status.get("authenticated")) == "1":
+            return True
+        time.sleep(1)
+    log("icomera: still not authenticated: %s" % status)
+    return False
+
+
+# ------------------------------------------------------------------ Oxyfi
+
+class Oxyfi:
+    """Replays the oxyfiLogin.js state machine, see oxyfiLoginDefines.js.
+
+    Backend (BE) replies carry a State and sometimes a QueueAction; node
+    (OX) replies carry Result and Data.  We act like a user who always
+    presses Continue.
+    """
+    NEXT_STATE_ON_SUCCESS = {"400005": {"S1": "S3", "S2": "S3"},
+                             "acceptTerms": {"A6": "A5"}}
+    AUTOMATIC = {"A5": "BE:setupRequest", "S6": "JS:setState(A5)"}
+    CONTINUE = {"A1": "JS:acceptTerms", "A6": "JS:acceptTerms",
+                "I2": "JS:reloadPage", "I1": "JS:reloadPage"}
+    NODE_NEXT = {"400005": "JS:loggedIn", "400201": "JS:initiate"}
+
+    def __init__(self, portal, be, node):
+        self.portal = portal
+        self.be_url = be
+        self.node_url = node
+        self.client_id = "".join(random.choices(string.ascii_letters + string.digits, k=10))
+        self.client_data = None
+        self.vars = {"state": "I1"}
+        self.steps = 0
+
+    def client_time(self):
+        return time.strftime("%Y.%m.%d %H:%M:%S.") + "%03d" % (time.time() * 1000 % 1000)
+
+    def backend(self, event, extra):
+        params = dict(extra)
+        params.update(Event=event, ClientId=self.client_id,
+                      ClientTime=self.client_time(),
+                      State=self.vars.get("state"),
+                      LoggedIn=self.vars.get("loggedIn", False))
+        if self.client_data is not None:
+            params["ClientData"] = self.client_data
+        if event == "initiate" and self.vars.get("initiateData"):
+            params["InitiateData"] = self.vars.pop("initiateData")
+        reply = jsonp(self.be_url + "/beCmd.php", {"params": json.dumps(params)})
+        debug("BE:%s -> %s" % (event, json.dumps(reply)[:300]))
+        if "ClientData" in reply:
+            self.client_data = reply["ClientData"]
+        nxt = self.NEXT_STATE_ON_SUCCESS.get(event, {}).get(self.vars.get("state"))
+        if "Data" in reply:
+            self.vars["initiateData" if len(str(reply["Data"])) >= 160 else "data"] = reply["Data"]
+        if reply.get("SetParameter"):
+            k, _, v = str(reply["SetParameter"]).partition("=")
+            self.vars[k] = v
+        if reply.get("QueueAction"):
+            if reply.get("State") not in (None, "null"):
+                self.vars["state"] = reply["State"]
+            return self.action(reply["QueueAction"], reply)
+        if reply.get("State") not in (None, "null", ""):
+            return self.set_state(reply["State"], reply)
+        if nxt:
+            return self.set_state(nxt, reply)
+        return None
+
+    def node(self, code, extra):
+        params = {}
+        if code == "400005":
+            params["Data"] = extra.get("Data") or self.vars.get("data") or self.vars.get("initiateData")
+        elif "Data" not in extra and self.vars.get("initiateData"):
+            params["Data"] = self.vars["initiateData"]
+        reply = jsonp(self.node_url + "/nodeCmd?RequestType=" + code, params)
+        debug("OX:%s -> %s" % (code, json.dumps(reply)[:300]))
+        if reply.get("Error") is True and reply.get("NodeFallback") is True:
+            raise RuntimeError("not on an Oxyfi network (NodeFallback)")
+        if code == "400201" and "Data" in reply:
+            self.vars["initiateData"] = reply["Data"]
+        nxt = self.NEXT_STATE_ON_SUCCESS.get(code, {}).get(self.vars.get("state"))
+        if code == "400005" and str(reply.get("Result")) != "1000":
+            log("oxyfi: node refused login: %s" % reply)
+            return self.set_state("I1", reply)
+        if code in self.NODE_NEXT:
+            r = self.action(self.NODE_NEXT[code], reply)
+            if r is not None:
+                return r
+        if nxt:
+            return self.set_state(nxt, reply)
+        return None
+
+    def set_state(self, state, reply):
+        debug("state %s -> %s" % (self.vars.get("state"), state))
+        self.vars["state"] = state
+        if state == "S3":
+            return True
+        if state in self.AUTOMATIC:
+            return self.action(self.AUTOMATIC[state], reply)
+        if state in self.CONTINUE:
+            return self.action(self.CONTINUE[state], reply)
+        return None
+
+    def action(self, act, reply):
+        self.steps += 1
+        if self.steps > 20:
+            raise RuntimeError("oxyfi: too many steps, giving up in state %s" % self.vars.get("state"))
+        prefix, _, req = act.partition(":")
+        debug("action " + act)
+        if prefix == "BE":
+            return self.backend(req, reply if req == "initiate" else {})
+        if prefix == "OX":
+            return self.node(req, reply)
+        if req == "initiate":
+            if str(reply.get("Result")) != "1000":
+                return self.set_state("I1", reply)
+            self.vars["haveLoginToken"] = True
+            return self.backend("initiate", {k: reply[k] for k in ("Data", "NodeId", "Result") if k in reply})
+        if req == "acceptTerms":
+            return self.backend("acceptTerms", {})
+        if req == "loggedIn":
+            self.vars["loggedIn"] = 1
+            try:
+                self.backend("setState", {"InitiatedBy": "Client reports that it is logged IN",
+                                          "LoggedIn": 1})
+            except RuntimeError:
+                pass
+            return True
+        if req.startswith("setState("):
+            return self.set_state(req[9:-1].strip("'\""), reply)
+        if req == "reloadPage":
+            if self.vars.get("reloaded"):
+                raise RuntimeError("oxyfi: portal keeps sending us back to %s" % self.vars["state"])
+            self.vars["reloaded"] = True
+            return self.run()
+        return None
+
+    def run(self):
+        self.vars["state"] = "I1"
+        self.backend("getConfiguration", {"operator": self.vars.get("portalName", "")})
+        return self.node("400201", {})
+
+
+def oxyfi(portal, base):
+    _, _, html = fetch(portal)
+    cfg = dict(re.findall(r"var\s+(beUrl|nodeUrl|portalName)\s*=\s*'([^']*)'", html))
+    if "beUrl" not in cfg or "nodeUrl" not in cfg:
+        log("oxyfi: portal page lacks beUrl/nodeUrl, not an Oxyfi portal?")
+        return False
+    scheme = urllib.parse.urlsplit(portal).scheme or "https"
+    be = base + "/be" if base else "https://" + cfg["beUrl"]
+    node = base + "/node" if base else scheme + "://" + cfg["nodeUrl"]
+    debug("oxyfi portal=%s be=%s node=%s" % (cfg.get("portalName"), be, node))
+    ox = Oxyfi(portal, be, node)
+    ox.vars["portalName"] = cfg.get("portalName", "")
+    try:
+        return ox.run() is True
+    except RuntimeError as e:
+        log("oxyfi: %s" % e)
+        return False
+
+
+HANDLERS = [
+    ("icomera", re.compile(r"(^|\.)(on\.icomera\.com|ombord\.info)$"), icomera),
+    ("oxyfi", re.compile(r"(^|\.)internet--access\.net$"), oxyfi),
+]
+
+
+def main():
+    global verbose, use_syslog
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-s", "--syslog", action="store_true", help="log to syslog (dispatcher mode)")
+    ap.add_argument("-p", "--probe", action="append", help="connectivity-check URL(s) to use")
+    ap.add_argument("--portal", help="skip probing, use this portal URL")
+    ap.add_argument("--base", help="override the handler's API base URL (testing)")
+    ap.add_argument("--handler", choices=[h[0] for h in HANDLERS],
+                    help="force a handler instead of matching the portal hostname (testing)")
+    ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--recheck", action="store_true",
+                    help="ask NetworkManager to re-run its connectivity check afterwards")
+    args = ap.parse_args()
+    verbose, use_syslog = args.verbose, args.syslog
+    if use_syslog:
+        syslog.openlog("captive-portal-login")
+
+    portal = args.portal
+    for attempt in range(args.retries):
+        if portal is None:
+            portal = find_portal(args.probe or PROBES)
+        if portal:
+            break
+        if attempt + 1 < args.retries:
+            time.sleep(3)
+    if not portal:
+        log("no captive portal detected")
+        return 0
+    host = urllib.parse.urlsplit(portal).hostname or ""
+    log("captive portal: " + portal)
+    for name, pat, fn in HANDLERS:
+        if (args.handler == name) if args.handler else pat.search(host):
+            ok = fn(portal, args.base)
+            log("%s: login %s" % (name, "succeeded" if ok else "FAILED"))
+            if ok and args.recheck:
+                subprocess.run(["nmcli", "networking", "connectivity", "check"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return 0 if ok else 1
+    log("no handler for portal host " + host)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
