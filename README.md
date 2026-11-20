@@ -34,9 +34,10 @@ Supported portals:
     sudo make install
 
 This puts `captive-portal-login` in `/usr/local/bin` and the dispatcher
-hook in `/etc/NetworkManager/dispatcher.d/no-wait.d/`.  The hook fires
-on `connectivity-change` with `CONNECTIVITY_STATE=PORTAL` and logs to
-syslog under `captive-portal-login`:
+hook in `/etc/NetworkManager/dispatcher.d/no-wait.d/`, linked from
+`dispatcher.d/` so NetworkManager runs it without waiting.  The hook
+fires on `connectivity-change` with `CONNECTIVITY_STATE=PORTAL` and logs
+to syslog under `captive-portal-login`:
 
     journalctl -t captive-portal-login
 
